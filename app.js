@@ -325,8 +325,8 @@ function doExport(type, elements) {
         // Safe JSON log for debugging (handles circular references gracefully)
         console.log('=== EXPORT INPUT JSON ===');
         console.log(safeStringify(input));
-        const json = safeStringify(input);
-        let testInput = JSON.parse(json);
+        // const json = safeStringify(input);
+        // let testInput = JSON.parse(json);
         // exportJson(input);
 
         let code = '';
@@ -338,7 +338,7 @@ function doExport(type, elements) {
                 filename = 'npoi-code.txt';
                 break;
             case 'jrxml':
-                code = exportToJrxmlV6(testInput);
+                code = exportToJrxmlV6(input);
                 filename = 'jrxml-code.txt';
                 break;
             case 'rdlc':

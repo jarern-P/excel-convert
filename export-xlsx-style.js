@@ -215,29 +215,6 @@ function exportToXlsxStyle({ ws: wsJson, workbook: wbJson, meta, images = [] }) 
     return styleCache.get(key);
   }
 
-  const hasMeaningfulStyle = (cell) => {
-
-  const hasValue =
-    cell.value !== null &&
-    cell.value !== undefined &&
-    cell.value !== '';
-
-  const hasBorder =
-    Object.values(cell.border || {}).some(
-      (side) => side && side.style
-    );
-
-  const hasFill =
-    !!(
-      cell.fill?.fgColor?.argb ||
-      cell.fill?.fgColor?.rgb ||
-      cell.fill?.bgColor?.argb ||
-      cell.fill?.bgColor?.rgb
-    );
-
-  return hasValue || hasBorder || hasFill;
-};
-
   // Collect all unique styles (use full column loop to catch all cells)
   const allStyleDeclarations = new Map();
   sections.forEach(section => {
@@ -245,11 +222,6 @@ function exportToXlsxStyle({ ws: wsJson, workbook: wbJson, meta, images = [] }) 
       const row = ws.getRow(r);
       for (let c = 1; c <= ws.columnCount; c++) {
         const cell = row.getCell(c);
-
-      // เก็บเฉพาะ Cell ที่มีค่า, Border หรือ Fill/สี
-      if (!hasMeaningfulStyle(cell)) {
-        continue;
-      }
 
         // Include slave cells of merged ranges so their border styles are captured
         const styleStr = buildStyleObjStr(cell);
