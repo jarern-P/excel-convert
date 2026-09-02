@@ -245,6 +245,73 @@ function exportToXlsxStyle({ ws: wsJson, workbook: wbJson, meta, images = [] }) 
   }
 
   // ============================================================
+  // BORDER PROPAGATION: Apply borders from preceding section to
+  // detail cells that lack borders, so the table grid is complete.
+  // ============================================================
+  // Helper: a border object is "real" when at least one side
+  // has a style defined (empty {} objects from ExcelJS are ignored).
+  function hasActualBorder(border) {
+    return !!(border && (border.top || border.bottom || border.left || border.right || border.diagonal));
+  }
+
+  if (detailSection) {
+    // Find the nearest section before the detail section that
+    // actually has real border definitions on its cells.  Typically
+    // this is the COLUMNHEADER band.
+    let borderSource = null;
+    for (const s of sections) {
+      if (s.key.toLowerCase() !== 'detail' && s.end < detailSection.start) {
+        let sectionHasBorders = false;
+        for (let r = s.start; r <= s.end && !sectionHasBorders; r++) {
+          const row = ws.getRow(r);
+          for (let c = 1; c <= ws.columnCount && !sectionHasBorders; c++) {
+            if (hasActualBorder(row.getCell(c).border)) sectionHasBorders = true;
+          }
+        }
+        if (sectionHasBorders) borderSource = s; // keep the latest one
+      }
+    }
+
+    if (borderSource) {
+      // Collect per-column border from the border source.
+      // Iterate all rows so the row closest to the detail wins;
+      // only overwrite with borders that have actual sides.
+      const columnBorders = {};
+      for (let r = borderSource.start; r <= borderSource.end; r++) {
+        const srcRow = ws.getRow(r);
+        for (let c = 1; c <= ws.columnCount; c++) {
+          const srcCell = srcRow.getCell(c);
+          if (hasActualBorder(srcCell.border)) {
+            columnBorders[c] = JSON.parse(JSON.stringify(srcCell.border));
+          }
+        }
+      }
+
+      // Apply those borders to every detail template cell that
+      // does NOT already have real borders of its own.
+      if (Object.keys(columnBorders).length > 0) {
+        for (let dr = detailSection.start; dr <= detailSection.end; dr++) {
+          const tplRow = ws.getRow(dr);
+          for (let c = 1; c <= ws.columnCount; c++) {
+            const cell = tplRow.getCell(c);
+            if (!hasActualBorder(cell.border) && columnBorders[c]) {
+              cell.border = JSON.parse(JSON.stringify(columnBorders[c]));
+
+              // Re-register the style so the generated code
+              // picks up the new border.
+              const styleStr = buildStyleObjStr(cell);
+              if (styleStr !== 'null') {
+                const varName = getStyleVarName(cell);
+                allStyleDeclarations.set(varName, styleStr);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ============================================================
   // PASS 2: GENERATE CODE — two buffers
   //   dataCode  : ws_data.push(...) statements (emitted first)
   //   styleCode : ws["A1"].s = ... statements (emitted after sheet creation)
