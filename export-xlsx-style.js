@@ -478,9 +478,19 @@ function exportToXlsxStyle({ ws: wsJson, workbook: wbJson, meta, images = [] }) 
   styleCode.push(`// APPLY CELL STYLES`);
   styleCode.push(`// ==========================`);
 
-  // Static section styles (use full column loop to catch all cells)
+  // Static section styles (use full column loop to catch all cells).
+  // Sections that come AFTER the detail band (pagefooter / groupfooter /
+  // summary / ...) do not keep their template row numbers in the final
+  // sheet: the detail loop injects data.length * detailRowCount rows below
+  // the detail start, which shifts every row below the band down at runtime.
+  // Those styles are therefore emitted through a dynamic row-offset block
+  // instead of fixed cell references.
+  const detailBaseRow = detailSection ? detailSection.end + 1 : null;
+  const afterDetailCells = []; // { r, c, styleVar, rpFormula } for rows below the detail band
+
   sections.forEach(section => {
     if (section.key.toLowerCase() === 'detail') return;
+    const isAfterDetail = detailBaseRow !== null && section.start >= detailBaseRow;
     for (let r = section.start; r <= section.end; r++) {
       const row = ws.getRow(r);
       for (let c = 1; c <= ws.columnCount; c++) {
@@ -494,6 +504,11 @@ function exportToXlsxStyle({ ws: wsJson, workbook: wbJson, meta, images = [] }) 
         const cellRef = encodeCellRef(r - 1, c - 1);
         const noteText = getCellNoteText(cell);
         const rpFormula = parseRPPRINTIF(noteText);
+
+        if (isAfterDetail) {
+          afterDetailCells.push({ r, c, styleVar, rpFormula });
+          continue;
+        }
 
         // Ensure cell exists before setting style (fixes 'Cannot set properties of undefined' error)
         if (rpFormula?.type === 'printWhen') {
@@ -510,6 +525,49 @@ function exportToXlsxStyle({ ws: wsJson, workbook: wbJson, meta, images = [] }) 
       }
     }
   });
+
+  // Dynamic style application for the sections below the detail band:
+  // each styled cell is applied at runtime with the row offset produced by
+  // the injected detail rows (detailStartRow + data.length * detailRowCount).
+  if (afterDetailCells.length > 0) {
+    styleCode.push(``);
+    styleCode.push(`// Dynamic styles for sections after detail (row-adjusted at runtime)`);
+    styleCode.push(`{`);
+    styleCode.push(`  const _sd = [`);
+
+    const sdEntries = [];
+    const sdCondCells = [];
+    afterDetailCells.forEach(({ r, c, styleVar, rpFormula }) => {
+      if (rpFormula?.type === 'printWhen') {
+        sdCondCells.push({ r, c, styleVar, rpFormula });
+        return;
+      }
+      sdEntries.push(`    [${r - detailBaseRow}, ${c - 1}, ${styleVar}]`);
+    });
+    sdEntries.forEach((line, i) => {
+      styleCode.push(`${line}${i < sdEntries.length - 1 ? ',' : ''}`);
+    });
+
+    styleCode.push(`  ];`);
+    styleCode.push(`  _sd.forEach(([r, c, s]) => {`);
+    styleCode.push(`    const ref = XLSX.utils.encode_cell({ r: detailStartRow + data.length * detailRowCount + r, c });`);
+    styleCode.push(`    if (!ws[ref]) ws[ref] = { v: '', t: 's' };`);
+    styleCode.push(`    ws[ref].s = s;`);
+    styleCode.push(`  });`);
+
+    sdCondCells.forEach(({ r, c, styleVar, rpFormula }) => {
+      const condition = convertToJsExpression(rpFormula.expression);
+      const relRow = r - detailBaseRow;
+      styleCode.push(`  // RPPRINTIF (template row ${r})`);
+      styleCode.push(`  if (${condition}) {`);
+      styleCode.push(`    const ref = XLSX.utils.encode_cell({ r: detailStartRow + data.length * detailRowCount + ${relRow}, c: ${c - 1} });`);
+      styleCode.push(`    if (!ws[ref]) ws[ref] = { v: '', t: 's' };`);
+      styleCode.push(`    ws[ref].s = ${styleVar};`);
+      styleCode.push(`  }`);
+    });
+
+    styleCode.push(`}`);
+  }
 
   // Detail section styles (applied after ws is created)
   if (detailSection) {
@@ -660,15 +718,28 @@ function exportToXlsxStyle({ ws: wsJson, workbook: wbJson, meta, images = [] }) 
   }
 
   // ===== ROW HEIGHTS =====
+  // Rows 1..detail.start-1 keep their template positions.  Detail template
+  // rows get per-record heights inside the data loop.  Rows below the detail
+  // band (pagefooter / summary / ...) shift down at runtime by
+  // detailRowCount * data.length, so they are applied through the dynamic
+  // row-offset block below.
   const DEFAULT_ROW_HEIGHT = ws.properties?.defaultRowHeight ?? 15;
+  const lastTemplateRow = ws.rowCount || ws.lastRow?.number || 0;
+  const staticLastRow = detailSection ? detailSection.start - 1 : lastTemplateRow;
+  const afterDetailHeights = [];
   let hasCustomHeight = false;
   const rowHeights = [];
 
-  for (let r = 1; r <= (ws.rowCount || ws.lastRow?.number || 0); r++) {
+  for (let r = 1; r <= lastTemplateRow; r++) {
     const row = ws.getRow(r);
     const h = row.height || DEFAULT_ROW_HEIGHT;
-    rowHeights.push({ height: h, isDefault: Math.abs(h - DEFAULT_ROW_HEIGHT) < 0.1 });
-    if (!hasCustomHeight && Math.abs(h - DEFAULT_ROW_HEIGHT) >= 0.1) hasCustomHeight = true;
+    const isDefault = Math.abs(h - DEFAULT_ROW_HEIGHT) < 0.1;
+    if (r <= staticLastRow) {
+      rowHeights.push({ height: h, isDefault });
+    } else if (detailBaseRow !== null && r >= detailBaseRow) {
+      afterDetailHeights.push({ row: r, height: h, isDefault });
+    }
+    if (!isDefault) hasCustomHeight = true;
   }
 
   if (hasCustomHeight) {
@@ -684,10 +755,28 @@ function exportToXlsxStyle({ ws: wsJson, workbook: wbJson, meta, images = [] }) 
       }
     });
     code.push(`];`);
+
+    if (afterDetailHeights.length > 0) {
+      code.push(`// Dynamic row heights for sections after detail`);
+      code.push(`{`);
+      code.push(`  const _rh = [`);
+      const rhEntries = afterDetailHeights.map((rh) => {
+        const entry = rh.isDefault ? '{}' : `{ hpt: ${rh.height} }`;
+        return `    [${rh.row - detailBaseRow}, ${entry}]`;
+      });
+      rhEntries.forEach((line, i) => {
+        code.push(`${line}${i < rhEntries.length - 1 ? ',' : ''}`);
+      });
+      code.push(`  ];`);
+      code.push(`  _rh.forEach(([r, h]) => { ws["!rows"][detailStartRow + data.length * detailRowCount + r] = h; });`);
+      code.push(`}`);
+    }
     code.push(``);
   }
 
   // ===== MERGES =====
+  // Merges that start below the detail band are shifted down at runtime by
+  // the rows the detail loop injects (same offset used for styles / heights).
   if (ws.model?.merges && ws.model.merges.length > 0) {
     code.push(`// ==========================`);
     code.push(`// MERGED CELLS`);
@@ -697,7 +786,10 @@ function exportToXlsxStyle({ ws: wsJson, workbook: wbJson, meta, images = [] }) 
       const [start, end] = m.split(':');
       const s = decodeAddr(start);
       const e = decodeAddr(end);
-      code.push(`  { s: { r: ${s.r - 1}, c: ${s.c - 1} }, e: { r: ${e.r - 1}, c: ${e.c - 1} } }${i < ws.model.merges.length - 1 ? ',' : ''}`);
+      const isAfterDetail = detailBaseRow !== null && s.r >= detailBaseRow;
+      const sRow = isAfterDetail ? `detailStartRow + data.length * detailRowCount + ${s.r - detailBaseRow}` : s.r - 1;
+      const eRow = isAfterDetail ? `detailStartRow + data.length * detailRowCount + ${e.r - detailBaseRow}` : e.r - 1;
+      code.push(`  { s: { r: ${sRow}, c: ${s.c - 1} }, e: { r: ${eRow}, c: ${e.c - 1} } }${i < ws.model.merges.length - 1 ? ',' : ''}`);
     });
     code.push(`];`);
     code.push(``);
